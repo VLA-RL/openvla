@@ -20,6 +20,7 @@ Run with:
 """
 
 import os
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,7 +28,6 @@ import draccus
 import torch
 import torch.distributed as dist
 import tqdm
-import wandb
 from accelerate import PartialState
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+import wandb
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
@@ -195,7 +196,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         cfg.data_root_dir,
         cfg.dataset_name,
         batch_transform,
-        resize_resolution=(vla.module.config.image_size, vla.module.config.image_size),
+        resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
@@ -220,11 +221,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
 
+    # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
+    recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
+
     # Train!
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        for step_idx, batch in enumerate(dataloader):
+        for batch_idx, batch in enumerate(dataloader):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
@@ -234,8 +240,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
                 loss = output.loss
 
-            # Backward!
-            loss.backward()
+            # Normalize loss to account for gradient accumulation
+            normalized_loss = loss / cfg.grad_accumulation_steps
+
+            # Backward pass
+            normalized_loss.backward()
 
             # Compute Accuracy and L1 Loss for Logging
             action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
@@ -256,21 +265,37 @@ def finetune(cfg: FinetuneConfig) -> None:
             )
             action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
 
-            # Push Metrics to W&B (every 10 steps)
-            if distributed_state.is_main_process and step_idx % 10 == 0:
+            # Store recent train metrics
+            recent_losses.append(loss.item())
+            recent_action_accuracies.append(action_accuracy.item())
+            recent_l1_losses.append(action_l1_loss.item())
+
+            # Compute gradient step index
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+
+            # Compute smoothened train metrics
+            #   =>> Equal to current step metrics when not using gradient accumulation
+            #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
+            smoothened_loss = sum(recent_losses) / len(recent_losses)
+            smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
+            smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
+
+            # Push Metrics to W&B (every 10 gradient steps)
+            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
                 wandb.log(
-                    {"train_loss": loss, "action_accuracy": action_accuracy, "l1_loss": action_l1_loss}, step=step_idx
+                    {"train_loss": smoothened_loss, "action_accuracy": smoothened_action_accuracy, "l1_loss": smoothened_l1_loss}, step=gradient_step_idx
                 )
 
             # Optimizer Step
-            if (step_idx + 1) % cfg.grad_accumulation_steps == 0:
+            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
+                optimizer.zero_grad()
                 progress.update()
 
             # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if step_idx > 0 and step_idx % cfg.save_steps == 0:
+            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
                 if distributed_state.is_main_process:
-                    print(f"Saving Model Checkpoint for Step {step_idx}")
+                    print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
                     # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
                     save_dir = adapter_dir if cfg.use_lora else run_dir
@@ -279,14 +304,18 @@ def finetune(cfg: FinetuneConfig) -> None:
                     processor.save_pretrained(run_dir)
                     vla.module.save_pretrained(save_dir)
 
-                    # Merge LoRA weights into model backbone for faster inference
-                    #   =>> TODO (kpertsch, siddk) :: This is inefficient; probably want to do this post-hoc...
-                    if cfg.use_lora:
-                        base_vla = AutoModelForVision2Seq.from_pretrained(
-                            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-                        )
-                        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-                        merged_vla = merged_vla.merge_and_unload()
+                # Wait for processor and adapter weights to be saved by main process
+                dist.barrier()
+
+                # Merge LoRA weights into model backbone for faster inference
+                #   =>> Note that merging is slow and can be done post-hoc to speed up training
+                if cfg.use_lora:
+                    base_vla = AutoModelForVision2Seq.from_pretrained(
+                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+                    )
+                    merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+                    merged_vla = merged_vla.merge_and_unload()
+                    if distributed_state.is_main_process:
                         merged_vla.save_pretrained(run_dir)
 
                 # Block on Main Process Checkpointing

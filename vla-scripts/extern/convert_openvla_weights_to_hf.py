@@ -7,10 +7,16 @@ via `trust_remote_code = True`.
 
 Theoretically, these changes should be fully compatible with directly merging the models into `transformers` down the
 line, with first-class support.
+
+Usage:
+    python vla-scripts/extern/convert_openvla_weights_to_hf.py \
+        --openvla_model_path_or_id <PATH TO PRISMATIC TRAINING RUN DIR> \
+        --output_hf_model_local_path <OUTPUT DIR FOR CONVERTED CHECKPOINT>
 """
 
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Union
@@ -38,8 +44,8 @@ class HFConvertConfig:
     output_hf_model_local_path: Path = Path(                            # Path to Local Path to save HF model
         "hf-convert/openvla-7b"
     )
-    output_hf_model_hub_path: str = "openvla/openvla-7b"                # Path to HF Hub Path for "final" HF model
-                                                                        #   => huggingface.co/openvla/openvla-{...}
+    output_hf_model_hub_path: str = "openvla/openvla-7b"                # (Optional) Path to HF Hub Path to push
+                                                                        # model to
 
     # HF Hub Credentials (required for Gated Models like LLaMa-2)
     hf_token: Union[str, Path] = Path(".hf_token")                      # Environment variable or Path to HF Token
@@ -238,18 +244,28 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
     hf_image_processor.save_pretrained(cfg.output_hf_model_local_path)
     hf_processor.save_pretrained(cfg.output_hf_model_local_path)
 
-    # Register AutoClasses
-    OpenVLAConfig.register_for_auto_class()
-    PrismaticImageProcessor.register_for_auto_class("AutoImageProcessor")
-    PrismaticProcessor.register_for_auto_class("AutoProcessor")
-    OpenVLAForActionPrediction.register_for_auto_class("AutoModelForVision2Seq")
+    # Copy `dataset_statistics.json` File to Converted Checkpoint Directory
+    output_dataset_statistics_json = cfg.output_hf_model_local_path / "dataset_statistics.json"
+    shutil.copyfile(dataset_statistics_json, output_dataset_statistics_json)
 
-    # Push to Hub
-    print("[*] Pushing Model & Processor to HF Hub")
-    hf_config.push_to_hub(cfg.output_hf_model_hub_path)
-    hf_model.push_to_hub(cfg.output_hf_model_hub_path, max_shard_size="7GB")
-    hf_image_processor.push_to_hub(cfg.output_hf_model_hub_path)
-    hf_processor.push_to_hub(cfg.output_hf_model_hub_path)
+    print(f"[*] Saving Complete! Saved converted checkpoint to: {cfg.output_hf_model_local_path}")
+
+    #####################################################################################
+    # Optional: Push Model to Hugging Face Hub
+    #####################################################################################
+
+    # # Register AutoClasses
+    # OpenVLAConfig.register_for_auto_class()
+    # PrismaticImageProcessor.register_for_auto_class("AutoImageProcessor")
+    # PrismaticProcessor.register_for_auto_class("AutoProcessor")
+    # OpenVLAForActionPrediction.register_for_auto_class("AutoModelForVision2Seq")
+
+    # # Push to HF Hub
+    # print("[*] Pushing Model & Processor to HF Hub")
+    # hf_config.push_to_hub(cfg.output_hf_model_hub_path)
+    # hf_model.push_to_hub(cfg.output_hf_model_hub_path, max_shard_size="7GB")
+    # hf_image_processor.push_to_hub(cfg.output_hf_model_hub_path)
+    # hf_processor.push_to_hub(cfg.output_hf_model_hub_path)
 
 
 if __name__ == "__main__":

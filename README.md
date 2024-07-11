@@ -6,8 +6,17 @@
 [![Python](https://img.shields.io/badge/python-3.10-blue?style=for-the-badge)](https://www.python.org)
 [![License](https://img.shields.io/github/license/TRI-ML/prismatic-vlms?style=for-the-badge)](LICENSE)
  
-[**Getting Started**](#getting-started) | [**Pretrained VLAs**](#pretrained-vlas) | [**Installation**](#installation) | 
+[**Getting Started**](#getting-started) | [**Pretrained VLAs**](#pretrained-vlas) | [**Installation**](#installation) | [**Fine-Tuning OpenVLA via LoRA**](#fine-tuning-openvla-via-lora) | [**Fully Fine-Tuning OpenVLA**](#fully-fine-tuning-openvla) |
 [**Training VLAs from Scratch**](#training-vlas-from-scratch) | [**Project Website**](https://openvla.github.io/)
+
+
+<hr style="border: 2px solid gray;"></hr>
+
+## Latest Updates
+- [2024-07-08] Added new sections: [Fine-Tuning OpenVLA via LoRA](#fine-tuning-openvla-via-lora), [Fully Fine-Tuning OpenVLA](#fully-fine-tuning-openvla)
+- [2024-06-13] Initial release
+
+<hr style="border: 2px solid gray;"></hr>
 
 A simple and scalable codebase for training and fine-tuning vision-language-action models (VLAs) for generalist robotic 
 manipulation:
@@ -27,7 +36,7 @@ To get started with loading and running OpenVLA models for inference, we provide
 HuggingFace `transformers` AutoClasses, with minimal dependencies.
 
 For example, to load `openvla-7b` for zero-shot instruction following in the
-[BridgeData V2 environments](https://rail-berkeley.github.io/bridgedata/) with a Widow-X robot:
+[BridgeData V2 environments](https://rail-berkeley.github.io/bridgedata/) with a WidowX robot:
 
 ```python
 # Install minimal dependencies (`torch`, `transformers`, `timm`, `tokenizers`, ...)
@@ -127,9 +136,236 @@ visually-conditioned language models; while you can use this repo to train VLMs 
 language (via `scripts/generate.py`) with existing OpenVLA models will not work (as we only train current OpenVLA models
 to generate actions, and actions alone).
 
+## Fine-Tuning OpenVLA via LoRA
+
+In this section, we discuss fine-tuning OpenVLA using Low-Rank Adaptation (LoRA) via the Hugging Face `transformers` library,
+which is recommended if you do not have sufficient compute to fully fine-tune a 7B-parameter model. The main script for LoRA
+fine-tuning is `vla-scripts/finetune.py`. (If you instead wish to do full fine-tuning, please see the
+[Fully Fine-Tuning OpenVLA](#fully-fine-tuning-openvla) section.)
+
+Below we show an example of how you can fine-tune the main OpenVLA checkpoint ([`openvla-7b`](https://huggingface.co/openvla/openvla-7b))
+via LoRA. Here we fine-tune on [BridgeData V2](https://rail-berkeley.github.io/bridgedata/) using a single A100
+GPU with 80 GB VRAM. (You can also fine-tune with a smaller GPU, as long as it has at least ~27 GB of memory,
+by modifying the batch size.)
+
+First, download the BridgeData V2 dataset:
+
+```bash
+# Change directory to your base datasets folder
+cd <PATH TO BASE DATASETS DIR>
+
+# Download the full dataset (124 GB)
+wget -r -nH --cut-dirs=4 --reject="index.html*" https://rail.eecs.berkeley.edu/datasets/bridge_release/data/tfds/bridge_dataset/
+
+# Rename the dataset to `bridge_orig` (NOTE: Omitting this step may lead to runtime errors later)
+mv bridge_dataset bridge_orig
+```
+
+Now, launch the LoRA fine-tuning script, as shown below. Note that `--batch_size==16` with `--grad_accumulation_steps==1`
+requires ~72 GB GPU memory. If you have a smaller GPU, you should reduce `--batch_size` and increase `--grad_accumulation_steps`
+to maintain an effective batch size that is large enough for stable training. If you have multiple GPUs and wish to train via
+PyTorch Distributed Data Parallel (DDP), simply set `--nproc-per-node` in the `torchrun` command below to the number of available GPUs.
+
+```bash
+torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
+  --vla_path "openvla/openvla-7b" \
+  --data_root_dir <PATH TO BASE DATASETS DIR> \
+  --dataset_name bridge_orig \
+  --run_root_dir <PATH TO LOG/CHECKPOINT DIR> \
+  --adapter_tmp_dir <PATH TO TEMPORARY DIR TO SAVE ADAPTER WEIGHTS> \
+  --lora_rank 32 \
+  --batch_size 16 \
+  --grad_accumulation_steps 1 \
+  --learning_rate 5e-4 \
+  --image_aug <True or False> \
+  --wandb_project <PROJECT> \
+  --wandb_entity <ENTITY> \
+  --save_steps <NUMBER OF GRADIENT STEPS PER CHECKPOINT SAVE>
+```
+
+Note: If you set `--image_aug==False` in the command above, you will observe nearly 100% `action_accuracy` in the training logs,
+since the [`openvla-7b`](https://huggingface.co/openvla/openvla-7b) model is already pretrained (without augmentations) on a
+superset of datasets that includes BridgeData V2.
+
+To LoRA fine-tune on a different dataset, you can download the dataset from the [Open X-Embodiment (OXE)](https://robotics-transformer-x.github.io/)
+mixture (see [this custom script](https://github.com/moojink/rlds_dataset_mod/blob/main/prepare_open_x.sh) for an example of how to download datasets
+from OXE). Alternatively, if you have a custom dataset that is not part of OXE, you can either (a) convert the dataset to the RLDS format which is
+compatible with our fine-tuning script (see [this repo](https://github.com/kpertsch/rlds_dataset_builder) for instructions on this), or (b) use your own
+custom PyTorch Dataset wrapper (see comments in `vla-scripts/finetune.py` for instructions). We recommend option (a) for most users; the RLDS dataset and
+dataloader are tested more extensively since we used these for all of our pretraining and fine-tuning experiments.
+
+Once you have integrated your new dataset, you can launch LoRA fine-tuning with the same `vla-scripts/finetune.py` script above. If you run into any issues,
+please visit the [VLA Troubleshooting](#vla-troubleshooting) section or search for a similar issue in the [OpenVLA GitHub Issues page](https://github.com/openvla/openvla/issues?q=)
+(including "Closed" issues). If you cannot find a similar issue there, feel free to create a new issue.
+
+## Fully Fine-Tuning OpenVLA
+
+In this section, we discuss <ins>fully fine-tuning</ins> OpenVLA (all 7.5 billion parameters) via native PyTorch Fully Sharded Data Parallel (FSDP)
+using the [Prismatic VLMs](https://github.com/TRI-ML/prismatic-vlms) training script. Full fine-tuning is more advanced/involved and is only recommended
+if you have sufficient compute (e.g., a full node of 8 A100 GPUs) and if LoRA fine-tuning is insufficient for your use case (e.g., if the fine-tuning distribution
+varies drastically from the pretraining distribution). Otherwise, we recommend that you try parameter-efficient fine-tuning via LoRA, which is described in the 
+[Fine-Tuning OpenVLA via LoRA](#fine-tuning-openvla-via-lora) section.
+
+For full fine-tuning, you will need to download [a different version of the OpenVLA model checkpoint](https://huggingface.co/openvla/openvla-7b-prismatic) that is compatible
+with the Prismatic VLMs codebase, which we built on top of to develop the OpenVLA model. You can download this Prismatic-compatible OpenVLA checkpoint using the git commands below
+(alternatively, you can download via the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/main/en/guides/cli)):
+
+```bash
+# Change directory to your base model checkpoints folder
+cd <PATH TO BASE MODEL CHECKPOINTS DIR>
+
+# Download checkpoint (30 GB) -- may take a few minutes
+git clone git@hf.co:openvla/openvla-7b-prismatic
+
+# If the command above did not download the full checkpoint,
+# manually fetch it via git Large File Storage (LFS)
+# Note: You may have to configure an SSH key for this to work
+cd openvla-7b-prismatic
+git lfs fetch --all
+```
+
+We show how you can fully fine-tune OpenVLA on [BridgeData V2](https://rail-berkeley.github.io/bridgedata/) using a single node with 8 GPUs. If you wish to
+use a different number of GPUs (or nodes), you can modify the VLA training configuration in [`prismatic/conf/vla.py`](prismatic/conf/vla.py).
+
+Download the BridgeData V2 dataset:
+
+```bash
+# Change directory to your base datasets folder
+cd <PATH TO BASE DATASETS DIR>
+
+# Download the full dataset (124 GB)
+wget -r -nH --cut-dirs=4 --reject="index.html*" https://rail.eecs.berkeley.edu/datasets/bridge_release/data/tfds/bridge_dataset/
+
+# Rename the dataset to `bridge_orig` (NOTE: Omitting this step may lead to runtime errors later)
+mv bridge_dataset bridge_orig
+```
+
+Next, create a [Hugging Face user access token](https://huggingface.co/docs/hub/en/security-tokens) and copy the token value (a string that starts with
+`hf_...`) into a file named `.hf_token` at the root directory of this repo (`openvla/.hf_token`).
+
+```bash
+# Go to openvla root directory
+cd openvla
+
+# Copy HF token value into token file. Replace "hf_..." with your own token value!
+# See: https://huggingface.co/docs/hub/en/security-tokens
+echo hf_... >>> .hf_token
+```
+
+Now, launch the training script. If you wish to use a different number of nodes or GPUs, modify the VLA training configuration in
+[`prismatic/conf/vla.py`](prismatic/conf/vla.py) and then change the `--nnodes` and `--nproc-per-node` arguments below accordingly.
+
+```bash
+torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/train.py \
+  --pretrained_checkpoint <PATH TO openvla/openvla-7b-prismatic CHECKPOINT FILE: step-295000-epoch-40-loss=0.2200.pt> \
+  --vla.type prism-dinosiglip-224px+mx-bridge \
+  --data_root_dir <PATH TO BASE DATASETS DIR> \
+  --run_root_dir <PATH TO LOG/CHECKPOINT DIR> \
+  --run_id <OPTIONAL RUN ID FOR WANDB LOGGING> \
+  --image_aug <True or False> \
+  --wandb_project <PROJECT> \
+  --wandb_entity <ENTITY> \
+  --save_interval <NUMBER OF GRADIENT STEPS PER CHECKPOINT SAVE> \
+  --is_resume False
+```
+
+Note that the `--is_resume` argument is set to `False` above since we are fine-tuning a pretrained checkpoint rather than resuming a paused training run.
+
+If your training run gets paused and you wish to resume from the latest checkpoint, change `--pretrained_checkpoint` to the latest checkpoint path,
+and then set `--is_resume==True` and specify `--resume_step` and `--resume_epoch` as the step and epoch number, respectively. For example, if you wish to
+resume training from a checkpoint named `step-010000-epoch-20-loss=0.0160.pt`, you would set `is_resume==True`, `resume_step==10000`, and `resume_epoch==20`.
+
+Note: If you run the BridgeData V2 fine-tuning command above, you should observe nearly 100% Action Token Accuracy in the training logs, since the
+[`openvla-7b`](https://huggingface.co/openvla/openvla-7b) model is already pretrained on a superset of datasets that includes BridgeData V2.
+
+To fully fine-tune OpenVLA on a different dataset, you can download the dataset from the [Open X-Embodiment (OXE)](https://robotics-transformer-x.github.io/)
+mixture (see [this custom script](https://github.com/moojink/rlds_dataset_mod/blob/main/prepare_open_x.sh) for an example of how to download datasets from OXE).
+Alternatively, if you have a custom dataset that is not part of OXE, you can convert the dataset to the RLDS format, which is compatible with our fine-tuning script
+(see [this repo](https://github.com/kpertsch/rlds_dataset_builder) for instructions on this). After downloading/converting the dataset, you will need to modify the following files:
+
+* [`prismatic/conf/vla.py`](prismatic/conf/vla.py): Add a new training configuration by creating an experiment class, and then register it in the `VLARegistry` at the bottom of the file.
+  * Make sure to create a new unique `vla_id` for your fine-tuning run, and adjust some configuration variables as needed – e.g., `expected_world_size` (number of GPUs),
+  `per_device_batch_size` (batch size per GPU), `global_batch_size` (total batch size), `shuffle_buffer_size` (number of samples in shuffle buffer per GPU), etc. See comments
+  under the `VLAConfig` class at the top of the file to understand the purpose of each variable.
+* [`prismatic/vla/datasets/rlds/oxe/mixtures.py`](prismatic/vla/datasets/rlds/oxe/mixtures.py): Define a new mixture for your fine-tuning mixture in the `OXE_NAMED_MIXTURES` dictionary.
+* [`prismatic/vla/datasets/rlds/oxe/transforms.py`](prismatic/vla/datasets/rlds/oxe/transforms.py): Define a new dataset transform function for your fine-tuning dataset, and add it to the
+`OXE_STANDARDIZATION_TRANSFORMS` registry at the bottom of the file.
+* [`prismatic/vla/datasets/rlds/oxe/configs.py`](prismatic/vla/datasets/rlds/oxe/configs.py): Add a new configuration specifying your fine-tuning dataset's observation and action spaces
+to the `OXE_DATASET_CONFIGS` dictionary.
+
+After completing the steps above, you can start full fine-tuning using the `vla-scripts/train.py` script. Make sure to set the `--vla.type` argument to the new `vla_id` that you added in `prismatic/conf/vla.py`.
+
+When you are finished with fine-tuning, you will need to convert the final model checkpoint to a version that is
+compatible with the Hugging Face `transformers` library. See the [Converting Prismatic Models to Hugging Face](#converting-prismatic-models-to-hugging-face) section for instructions.
+
+If you run into any issues, please visit the [VLA Troubleshooting](#vla-troubleshooting) section or search for a similar issue in the
+[OpenVLA GitHub Issues page](https://github.com/openvla/openvla/issues?q=) (including "Closed" issues). If you cannot find a similar issue there, feel free to create a new issue.
+
+### Converting Prismatic Models to Hugging Face
+
+If you have used the Prismatic VLMs codebase to train your model (e.g., if you did full fine-tuning of OpenVLA on a
+new dataset), you will need to convert the final checkpoint to a version that is compatible with Hugging Face
+`transformers` AutoClasses. We discuss how to do so in this section.
+
+Let's say your training run directory is `PRISMATIC_RUN_DIR` (e.g., `prism-dinosiglip-224px+mx-oxe-magic-soup-plus+n8+b32+x7`).
+Inside this directory, there should be a directory called `checkpoints` which contains saved model checkpoints (e.g.,
+`step-295000-epoch-40-loss=0.2200.pt`). The Prismatic-to-Hugging-Face conversion script
+([convert_openvla_weights_to_hf.py](vla-scripts/extern/convert_openvla_weights_to_hf.py)) expects a checkpoint file
+named `latest-checkpoint.pt`. Therefore, you should first create a symbolic link called `latest-checkpoint.pt` that
+points to the checkpoint file that you wish to convert:
+
+```bash
+# Go to your Prismatic training run's `checkpoints` directory
+cd PRISMATIC_RUN_DIR/checkpoints
+
+# Create symbolic link pointing to your checkpoint file
+ln -s <YOUR CHECKPOINT FILENAME> latest-checkpoint.pt
+```
+
+Then, launch the conversion script to convert the checkpoint from the Prismatic VLMs format to the Hugging Face format:
+
+```bash
+python vla-scripts/extern/convert_openvla_weights_to_hf.py \
+    --openvla_model_path_or_id <PRISMATIC_RUN_DIR> \
+    --output_hf_model_local_path <OUTPUT DIR FOR CONVERTED CHECKPOINT>
+```
+
+The command above will save the HF-compatible checkpoint in `output_hf_model_local_path`. Now you can load the checkpoint
+with HF AutoClasses as normal, as shown below. Note that there is an additional necessary step to register the OpenVLA model
+to HF AutoClasses before loading it because you are loading a locally saved checkpoint rather than one that is pushed to the
+HF Hub (see [here](https://huggingface.co/docs/transformers/en/custom_models#registering-a-model-with-custom-code-to-the-auto-classes)
+for details).
+
+```python
+import torch
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+# Register OpenVLA model to HF AutoClasses (not needed if you pushed model to HF Hub)
+AutoConfig.register("openvla", OpenVLAConfig)
+AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+# Load Processor & VLA
+processor = AutoProcessor.from_pretrained("<PATH TO CONVERTED CHECKPOINT DIR>", trust_remote_code=True)
+vla = AutoModelForVision2Seq.from_pretrained(
+    "<PATH TO CONVERTED CHECKPOINT DIR>",
+    attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
+    torch_dtype=torch.bfloat16,
+    low_cpu_mem_usage=True,
+    trust_remote_code=True,
+).to("cuda:0")
+
+...
+```
+
 ## Training VLAs from Scratch
 
-We provide full instructions and configurations for training OpenVLA models on (arbitrary subsets of) the
+We provide full instructions and configurations for training VLA models on (arbitrary subsets of) the
 [Open X-Embodiment (OXE) Dataset](https://robotics-transformer-x.github.io/). If you run in to any issues with 
 the following, see [VLA Troubleshooting](#vla-troubleshooting) below (or file a GitHub Issue).
 
